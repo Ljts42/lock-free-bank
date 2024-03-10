@@ -9,7 +9,7 @@ import kotlinx.atomicfu.*
  * Account instances in [accounts] array never suffer from ABA problem.
  * See also "Practical lock-freedom" by Keir Fraser. See [acquire] method.
  *
- * :TODO: This implementation has to be completed, so that it is thread-safe and lock-free.
+ * @author Sentemov Lev
  */
 class BankImpl(override val numberOfAccounts: Int) : Bank {
     /**
@@ -68,16 +68,24 @@ class BankImpl(override val numberOfAccounts: Int) : Bank {
     }
 
     override fun withdraw(index: Int, amount: Long): Long {
-        // todo: write withdraw operation using deposit as an example
-        /*
-         * Basically, implementation of this method must perform the logic of the following code "atomically":
-         */
         require(amount > 0) { "Invalid amount: $amount" }
-        val account = account(index)
-        check(account.amount - amount >= 0) { "Underflow" }
-        val updated = Account(account.amount - amount)
-        accounts[index].value = updated
-        return updated.amount
+        check(amount <= MAX_AMOUNT) { "Overflow" }
+        /*
+         * This operation depends only on a single account, thus it can be directly
+         * performed using a regular lock-free compareAndSet loop.
+         */
+        while (true) {
+            val account = account(index)
+            /*
+             * If there is a pending operation on this account, then help to complete it first using
+             * its invokeOperation method. If the result is false then there is no pending operation,
+             * thus the account can be safely updated.
+             */
+            if (account.invokeOperation()) continue
+            check(account.amount - amount >= 0) { "Underflow" }
+            val updated = Account(account.amount - amount)
+            if (accounts[index].compareAndSet(account, updated)) return updated.amount
+        }
     }
 
     override fun transfer(fromIndex: Int, toIndex: Int, amount: Long) {
@@ -103,27 +111,19 @@ class BankImpl(override val numberOfAccounts: Int) : Bank {
      * This method returns null if op.completed is true.
      */
     private fun acquire(index: Int, op: Op): AcquiredAccount? {
-        // todo: write the implementation of this method with the following logic:
-        /*
-         * This method must loop trying to replace accounts[index] with an instance of
-         *     new AcquiredAccount(<old-amount>, op) until that successfully happens and return the
-         *     instance of AcquiredAccount in this case.
-         *
-         * If current account is already "Acquired" by another operation, then this method must help that
-         * other operation by invoking "invokeOperation" and continue trying.
-         *
-         * Because accounts[index] does not have an ABA problem, there is no need to implement full-blown
-         * DCSS operation with descriptors for DCSS operation as explained in Harris CASN work. A simple
-         * lock-free compareAndSet loop suffices here if op.completed is checked after the accounts[index]
-         * is read.
-         *
-         * Basically, implementation of this method must perform the logic of the following code "atomically":
-         */
-        if (op.completed) return null
-        val account = account(index)
-        val acquiredAccount = AcquiredAccount(account.amount, op)
-        accounts[index].value = acquiredAccount
-        return acquiredAccount
+        while (true) {
+            val account = account(index)
+            if (op.completed) return null
+            if (account is AcquiredAccount) {
+                if (account.op != op) {
+                    if (account.invokeOperation()) continue
+                } else {
+                    return account
+                }
+            }
+            val updated = AcquiredAccount(account.amount, op)
+            if (accounts[index].compareAndSet(account, updated)) return updated
+        }
     }
 
     /**
@@ -224,24 +224,35 @@ class BankImpl(override val numberOfAccounts: Int) : Bank {
         var errorMessage: String? = null
 
         override fun invokeOperation() {
-            // todo: write implementation for this method, use TotalAmountOp as an example
-            /*
-             * In the implementation of this operation only two accounts (with fromIndex and toIndex) needs
-             * to be acquired. Unlike TotalAmountOp, this operation has its own result in errorMessage string,
-             * and it must also update AcquiredAccount.newAmount fields before setting completed to true
-             * and invoking release on those acquired accounts.
-             *
-             * Basically, implementation of this method must perform the logic of the following code "atomically":
-             */
-            val from = account(fromIndex)
-            val to = account(toIndex)
-            when {
-                amount > from.amount -> errorMessage = "Underflow"
-                to.amount + amount > MAX_AMOUNT -> errorMessage = "Overflow"
-                else -> {
-                    accounts[fromIndex].value = Account(from.amount - amount)
-                    accounts[toIndex].value = Account(to.amount + amount)
+            require(amount > 0) { "Invalid amount: $amount" }
+            require(fromIndex != toIndex) { "fromIndex == toIndex" }
+
+            val from: AcquiredAccount?
+            val to: AcquiredAccount?
+            if (fromIndex < toIndex) {
+                from = acquire(fromIndex, this)
+                to = acquire(toIndex, this)
+            } else {
+                to = acquire(toIndex, this)
+                from = acquire(fromIndex, this)
+            }
+            if (from != null && to != null) {
+                when {
+                    amount > from.amount -> errorMessage = "Underflow"
+                    to.amount + amount > MAX_AMOUNT -> errorMessage = "Overflow"
+                    else -> {
+                        from.newAmount = from.amount - amount
+                        to.newAmount = to.amount + amount
+                    }
                 }
+            }
+            completed = true
+            if (fromIndex < toIndex) {
+                release(toIndex, this)
+                release(fromIndex, this)
+            } else {
+                release(fromIndex, this)
+                release(toIndex, this)
             }
         }
     }
